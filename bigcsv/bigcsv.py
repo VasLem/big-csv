@@ -1,77 +1,145 @@
-import os 
+import os
 import boto3
-import pandas as pd 
+import pandas as pd
 import anndata as an
-import pathlib 
-import warnings 
-warnings.simplefilter(action='ignore', category=FutureWarning) # ignore the anndata future warning, fairly unncessary
+import pathlib
+import warnings
+from scipy.sparse import csr_matrix
+from typing import Any
+import logging
+import subprocess
+import sys
+from tempfile import mkdtemp
+from shutil import rmtree
+from math import ceil
+import csv
 
-from scipy.sparse import csr_matrix 
-from typing import Any 
+warnings.simplefilter(
+    action="ignore", category=FutureWarning
+)  # ignore the anndata future warning, fairly unncessary
+
+
+LOGGER = logging.getLogger("bigcsv")
+LOGGER.setLevel("INFO")
+
+try:
+    import pgzip as gzip
+except ImportError:
+    import gzip
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, *args, **kwargs: x
+
+
+_open = open
+
+
+def exopen(csv: str, mode: str = "r", *args, njobs=-1, **kwargs):
+
+    if njobs == -1:
+        njobs = os.cpu_count()
+    if csv.endswith(".gz"):
+        try:
+            return gzip.open(
+                csv, mode + "t" if not mode.endswith("b") else mode, *args, **kwargs
+            )
+        except:
+            return gzip.open(csv, mode + "t" if not mode.endswith("b") else mode)
+    return _open(csv, mode, *args, **kwargs)
+
 
 def transpose_csv(
-    file: str, 
-    outfile: str, 
-    insep: str, 
-    outsep: str,
-    chunksize: int, 
-    chunkfolder: str,
-    save_chunks: bool,
-    quiet=bool, 
+    inputfile: str,
+    outfile: str,
+    chunksize,
+    insep=",",
+    outsep=",",
 ) -> None:
     """
-    Calculates the transpose of a .csv too large to fit in memory 
+    Calculates the transpose of a file too large to fit in memory.
 
     Parameters:
-    file: Path to input file 
+    inputfile: Path to input file
     outfile: Path to output file (transposed input file)
+    chunksize: Number of lines per iteration
     insep: Separator for input file,  default is ','
     outsep: Separator for output file, default is ','
-    chunksize: Number of lines per iteration
-    chunkfolder: Path to chunkfolder
-    quiet: Boolean indicating whether to print progress or not 
 
     Returns:
     None
     """
 
-    # First, get the number of lines in the file (total number we have to process)
-    with open(file) as f:
-        lines = len(f.readlines())
-    
-    if not quiet: print(f'Number of lines to process is {lines - 1}')
-
-    # Get just the outfile name for writing chunks
-    outfile_split = outfile.split('/')
-    outfile_name = outfile_split[-1][:-4] # takes /path/to/file.csv --> file 
-
-    if not os.path.isdir(chunkfolder):
-        if not quiet: print(f'Making chunk folder {chunkfolder = }')
-        os.mkdir(chunkfolder)
-
-    num_chunks = lines // chunksize + int(lines % chunksize == 0) # if we have one last small chunk or not 
-    if not quiet: print(f'Total number of chunks is {num_chunks}')
-
-    for df, l in zip(pd.read_csv(file, sep=insep, chunksize=chunksize), range(0, num_chunks + 1)):  
-        if not quiet: print(f'Working on chunk {l} out of {num_chunks}')
-        df = df.T
-
-        if not quiet: print(f'Writing chunk {l} to csv')
-        df.to_csv(os.path.join(chunkfolder, f'chunk_{outfile_name}_{l}.csv'), sep=outsep, index=False)
-
-    if not quiet: print(f'Combining chunks from {chunkfolder} into {outfile}')
-
-    os.system(
-        f"paste -d ',' {chunkfolder}/* > {outfile}"
+    tmpfolder = mkdtemp()
+    chunkfolder = os.path.join(tmpfolder, "chunks")
+    os.makedirs(chunkfolder, exist_ok=True)
+    tfile = (
+        outfile
+        if not outfile.endswith(".gz")
+        else os.path.join(tmpfolder, os.path.basename(outfile)[:-3])
     )
+    if inputfile.endswith(".gz"):
+        LOGGER.info("Uncompressing..")
+        nfile = os.path.join(tmpfolder, os.path.basename(inputfile)[:-3])
+        with exopen(inputfile, "r") as inp, exopen(nfile, "w") as out:
+            out.write(inp.read())
+        inputfile = nfile
+    # First, get the number of lines in the file (total number we have to process)
+    with open(inputfile) as f:
+        lines = len(f.readlines())
+    LOGGER.info(f"Number of lines to process: {lines - 1}")
 
-    if not save_chunks:
-        if not quiet: print('Finished combining chunks, deleting chunks.')
-        os.system(
-            f"rm -rf {chunkfolder}/*"
+    num_chunks = ceil(lines / chunksize)
+    iterator = enumerate(
+        pd.read_csv(
+            inputfile,
+            header=None,
+            index_col=None,
+            sep=insep,
+            chunksize=chunksize,
+            keep_default_na=False,
         )
+    )
+    chunks = []
+    if LOGGER.getEffectiveLevel() >= logging.INFO:
+        iterator = tqdm(iterator, total=num_chunks)
+    for l, df in iterator:
+        df: pd.DataFrame = df.T.fillna("")
+        chunks.append(os.path.join(chunkfolder, f"chunk_{l}"))
+        with open(chunks[-1], "w") as f:
+            for _, row in df.iterrows():
+                f.write(outsep.join([str(x) for x in row]) + "\n")
 
-    if not quiet: print('Done.')
+    LOGGER.debug(f"Combining chunks from {chunkfolder} into {tfile}...")
+
+    if sys.platform.startswith("linux") or sys.platform == "darwin":
+        cstring = '"' + '" "'.join(chunks) + '"'
+        psep_arg = f"-d '{outsep}'" if outsep != "\t" else ""
+        os.system(f"paste {psep_arg} {cstring} > {tfile}")
+    else:
+
+        cstring = '"' + '", "'.join(chunks) + '"'
+        p = subprocess.Popen(
+            f'powershell.exe -ExecutionPolicy RemoteSigned paste-content -Path {cstring} -Delimiter "{outsep}" > {tfile}"',
+            stdout=sys.stdout,
+        )
+        p.communicate()
+
+    LOGGER.info("Finished combining chunks, deleting chunks...")
+    rmtree(chunkfolder)
+    if os.path.dirname(outfile):
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+    if outfile.endswith(".gz"):
+        LOGGER.info("Compressing..")
+        with open(tfile, "r") as inp, exopen(outfile, "w") as out:
+            for line in inp:
+                out.write(line)
+
+    LOGGER.info("Done.")
+    rmtree(tmpfolder)
+
+
 
 def to_h5ad(
     file: str,
@@ -130,7 +198,6 @@ class BigCSV:
         chunksize: str=400, 
         save_chunks: bool=False,
         quiet: bool=False,
-        chunkfolder: str=None,
     ):
         self.file = file 
         self.outfile = outfile
@@ -139,18 +206,10 @@ class BigCSV:
         self.chunksize = chunksize
         self.save_chunks = save_chunks
         self.quiet = quiet
-        self.chunkfolder = chunkfolder
 
         outfile_split = file.split('/')
         self.outfile_name = outfile_split[-1][:-4] #takes /path/to/file.csv --> file 
 
-        if chunkfolder is None:
-            if not quiet: print('Chunkfolder not passed, generating...')
-            self.chunkfolder = pathlib.Path(file).stem 
-
-        if not os.path.isdir(self.chunkfolder):
-            if not self.quiet: print(f"Creating chunkfolder {self.chunkfolder}")
-            os.makedirs(self.chunkfolder, exist_ok=True)
 
     def transpose_csv(
         self,
@@ -160,12 +219,11 @@ class BigCSV:
             raise ValueError("Error, either self.outfile must not be None or outfile must not be None.")
 
         transpose_csv(
-            file=self.file, 
+            inputfile=self.file, 
             outfile=(outfile if outfile is not None else self.outfile), 
             insep=self.insep, 
             outsep=self.outsep,
             chunksize=self.chunksize, 
-            chunkfolder=self.chunkfolder,
             save_chunks=self.save_chunks,
             quiet=self.quiet, 
         )
